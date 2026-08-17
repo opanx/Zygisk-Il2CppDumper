@@ -25,8 +25,13 @@ void *search_in_module(const char *module_name_part, const std::string &hex_patt
 // Write a raw memory range to outDir/name.
 void dump_memory_range(const char *outDir, const char *name, uintptr_t start, size_t len);
 
-// Find "global-metadata.dat" inside the libil2cpp module, scan backwards for
-// the metadata magic (0xFAB11BAF) and dump the decrypted metadata from memory.
-void dump_lib_and_metadata(const char *outDir);
+// Find the mapping [start,end) that contains addr.
+bool find_mapping_containing(uintptr_t addr, uintptr_t &start, uintptr_t &end);
+
+// Find "global-metadata.dat" inside the il2cpp module, scan backwards for the
+// metadata magic (0xFAB11BAF) and dump the decrypted metadata from memory.
+// base_hint: if non-zero, dump the module containing this address (the real
+// decrypted lib, located via dladdr) instead of the on-disk stub.
+void dump_lib_and_metadata(const char *outDir, uintptr_t base_hint = 0);
 
 #endif //ZYGISK_IL2CPPDUMPER_SIGSEARCH_H

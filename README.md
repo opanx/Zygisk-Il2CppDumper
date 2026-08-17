@@ -26,7 +26,13 @@ This fork targets **Mobile Legends: Bang Bang** (`com.mobile.legends`) by defaul
 
 ### 1. Signature search fallback (stripped exports)
 
-MLBB strips the exported symbols from `libil2cpp.so`, so the normal `xdl_sym()` lookup fails and `dump.cs` is never generated. This fork falls back to a **byte-pattern (signature) scan** of the module in memory to locate the il2cpp API functions.
+Some games strip the exported symbols from `libil2cpp.so`, so the normal `xdl_sym()` lookup fails and `dump.cs` is never generated. This fork falls back to a **byte-pattern (signature) scan** of the module in memory to locate the il2cpp API functions.
+
+### 1b. MLBB stub-loader wait (Mobile Legends specific)
+
+MLBB ships a **small stub** `libil2cpp.so` (~384 KB) that exports every il2cpp API as a 16-byte trampoline jumping through a global slot `m_<name>_ptr`. The real (decrypted) lib is unpacked from `assets/Resources4-*.dat` at runtime and registers into those slots via `il2cpp_api_register_symbols()`. Calling a trampoline before registration jumps to NULL → crash / no dump.
+
+The module detects the exported `m_*_ptr` slots, **waits until the real lib registers them** (up to 120 s), then replaces the API pointers with the real addresses — the trampolines are never called early.
 
 ### 2. Online signature config (no recompile per game version)
 

@@ -105,6 +105,49 @@ static uint64_t resolve_base_from_apis() {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// MLBB-style stub loader (Mobile Legends): libil2cpp.so on disk is a small
+// stub that exports every il2cpp api as a 16-byte trampoline:
+//     adrp x8, ...; ldr x8, [x8, #off]; ldr x0, [x8]; br x0
+// i.e. it jumps through a global slot "m_<name>_ptr". The real (decrypted)
+// lib registers into those slots later via il2cpp_api_register_symbols().
+// Calling a trampoline before registration jumps to NULL -> crash / no dump.
+// Fix: resolve the slot addresses (they are exported OBJECT symbols), wait
+// until the real lib fills them, then overwrite our api pointers with the
+// real function addresses.
+// ---------------------------------------------------------------------------
+static void init_via_stub_slots(void *handle) {
+    void **domain_slot = (void **) xdl_sym(handle, "m_il2cpp_domain_get_ptr", nullptr);
+    if (!domain_slot) {
+        LOGI("no m_*_ptr slots exported (normal lib), skipping slot wait");
+        return;
+    }
+    LOGI("stub-style lib detected, waiting for real lib registration...");
+    const int kTimeoutSec = 120;
+    int waited = 0;
+    for (; waited < kTimeoutSec; ++waited) {
+        if (*domain_slot) break;
+        sleep(1);
+    }
+    if (!*domain_slot) {
+        LOGE("real lib never registered within %ds", kTimeoutSec);
+        return;
+    }
+    LOGI("real lib registered after ~%ds, resolving real api addresses", waited);
+    int resolved = 0;
+    for (const auto &s : kApiSlots) {
+        std::string slot_name = "m_";
+        slot_name += s.name;
+        slot_name += "_ptr";
+        void **slot = (void **) xdl_sym(handle, slot_name.c_str(), nullptr);
+        if (slot && *slot) {
+            *s.slot = *slot;
+            ++resolved;
+        }
+    }
+    LOGI("resolved %d real functions via m_*_ptr slots", resolved);
+}
+
 void init_il2cpp_api(void *handle) {
 #define DO_API(r, n, p) {                      \
     n = (r (*) p)xdl_sym(handle, #n, nullptr); \
@@ -406,6 +449,7 @@ void il2cpp_api_init(void *handle) {
     LOGI("il2cpp_handle: %p", handle);
     patterns_init();
     init_il2cpp_api(handle);
+    init_via_stub_slots(handle);
     api_fallback_search();
     il2cpp_base = resolve_base_from_apis();
     LOGI("il2cpp_base: %" PRIx64"", il2cpp_base);
@@ -508,5 +552,5 @@ void il2cpp_dump(const char *outDir) {
     // Bonus: also save the decrypted libil2cpp.so and global-metadata.dat
     // straight from memory, so they can be analysed offline with
     // Il2CppDumper / IDA even when the on-disk copies are packed.
-    dump_lib_and_metadata(outDir);
+    dump_lib_and_metadata(outDir, (uintptr_t) il2cpp_base);
 }

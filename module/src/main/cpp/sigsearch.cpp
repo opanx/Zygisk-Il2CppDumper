@@ -6,6 +6,7 @@
 #include <cstring>
 #include <string>
 
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -136,14 +137,66 @@ void dump_memory_range(const char *outDir, const char *name, uintptr_t start, si
     LOGI("dumped %s: %zu bytes -> %s", name, written, outPath.c_str());
 }
 
-void dump_lib_and_metadata(const char *outDir) {
+bool find_mapping_containing(uintptr_t addr, uintptr_t &start, uintptr_t &end) {
+    FILE *fp = fopen("/proc/self/maps", "r");
+    if (!fp) return false;
+    char line[512];
+    bool found = false;
+    while (fgets(line, sizeof(line), fp)) {
+        unsigned long long s = 0, e = 0, off = 0;
+        char perms[8] = {0};
+        char dev[16] = {0};
+        char inode[16] = {0};
+        char path[256] = {0};
+        if (sscanf(line, "%llx-%llx %7s %llx %15s %15s %255s", &s, &e, perms, &off,
+                   dev, inode, path) != 7)
+            continue;
+        if (addr >= (uintptr_t) s && addr < (uintptr_t) e) {
+            start = (uintptr_t) s;
+            end = (uintptr_t) e;
+            found = true;
+            break;
+        }
+    }
+    fclose(fp);
+    return found;
+}
+
+void dump_lib_and_metadata(const char *outDir, uintptr_t base_hint) {
     uintptr_t base = 0;
     size_t size = 0;
-    if (!find_module_range("libil2cpp.so", base, size)) {
+    if (base_hint) {
+        Dl_info info;
+        if (dladdr((const void *) base_hint, &info) && info.dli_fname) {
+            if (!find_module_range(info.dli_fname, base, size)) {
+                LOGW("module %s not in maps, fallback to containing mapping",
+                     info.dli_fname);
+                uintptr_t s = 0, e = 0;
+                if (find_mapping_containing(base_hint, s, e)) {
+                    base = s;
+                    size = e - s;
+                }
+            } else {
+                LOGI("real il2cpp module %s @ %" PRIxPTR " size 0x%zx",
+                     info.dli_fname, base, size);
+            }
+        } else {
+            uintptr_t s = 0, e = 0;
+            if (find_mapping_containing(base_hint, s, e)) {
+                base = s;
+                size = e - s;
+            }
+        }
+    } else if (!find_module_range("libil2cpp.so", base, size)) {
         LOGW("libil2cpp.so not mapped, skip lib/metadata dump");
         return;
+    } else {
+        LOGI("libil2cpp.so @ %" PRIxPTR " size 0x%zx", base, size);
     }
-    LOGI("libil2cpp.so @ %" PRIxPTR " size 0x%zx", base, size);
+    if (!base || !size) {
+        LOGW("no usable module range for lib/metadata dump");
+        return;
+    }
     dump_memory_range(outDir, "libil2cpp_dump.so", base, size);
 
     // Locate the "global-metadata.dat" string inside the module, then scan
