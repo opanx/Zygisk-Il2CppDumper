@@ -16,21 +16,56 @@
 #include <sys/mman.h>
 #include <linux/unistd.h>
 #include <array>
+#include <cstdio>
+#include <string>
 
-void hack_start(const char *game_data_dir) {
-    bool load = false;
-    for (int i = 0; i < 10; i++) {
-        void *handle = xdl_open("libil2cpp.so", 0);
-        if (handle) {
-            load = true;
-            il2cpp_api_init(handle);
-            il2cpp_dump(game_data_dir);
-            break;
-        } else {
-            sleep(1);
+// Find the on-disk path of the loaded il2cpp library from /proc/self/maps.
+// Used as a fallback when xdl_open("libil2cpp.so") cannot resolve it
+// (renamed lib / odd linker namespace).
+static std::string find_il2cpp_path() {
+    FILE *fp = fopen("/proc/self/maps", "r");
+    if (!fp) return {};
+    char line[512];
+    std::string path;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "il2cpp")) {
+            const char *p = strrchr(line, ' ');
+            if (p) {
+                std::string candidate(p + 1);
+                // strip trailing newline
+                while (!candidate.empty() &&
+                       (candidate.back() == '\n' || candidate.back() == '\r')) {
+                    candidate.pop_back();
+                }
+                if (!candidate.empty() && candidate[0] == '/') {
+                    path = candidate;
+                    break;
+                }
+            }
         }
     }
-    if (!load) {
+    fclose(fp);
+    return path;
+}
+
+void hack_start(const char *game_data_dir) {
+    void *handle = nullptr;
+    for (int i = 0; i < 10; i++) {
+        handle = xdl_open("libil2cpp.so", 0);
+        if (handle) break;
+        sleep(1);
+    }
+    if (!handle) {
+        std::string path = find_il2cpp_path();
+        if (!path.empty()) {
+            LOGW("xdl_open libil2cpp.so failed, trying %s", path.c_str());
+            handle = xdl_open(path.c_str(), 0);
+        }
+    }
+    if (handle) {
+        il2cpp_api_init(handle);
+        il2cpp_dump(game_data_dir);
+    } else {
         LOGI("libil2cpp.so not found in thread %d", gettid());
     }
 }

@@ -37,6 +37,9 @@ add_library(${MODULE_NAME} SHARED
         main.cpp
         hack.cpp
         il2cpp_dump.cpp
+        sigsearch.cpp
+        patterns.cpp
+        net.cpp
         ${xdl-src})
 target_link_libraries(${MODULE_NAME} log)
 

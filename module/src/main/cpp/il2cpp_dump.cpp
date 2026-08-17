@@ -16,6 +16,8 @@
 #include "log.h"
 #include "il2cpp-tabledefs.h"
 #include "il2cpp-class.h"
+#include "patterns.h"
+#include "sigsearch.h"
 
 #define DO_API(r, n, p) r (*n) p
 
@@ -24,6 +26,84 @@
 #undef DO_API
 
 static uint64_t il2cpp_base = 0;
+
+// ---------------------------------------------------------------------------
+// Signature search fallback for games that strip the exported symbols from
+// libil2cpp.so (e.g. Mobile Legends / com.mobile.legends). For every api that
+// xdl_sym() could not resolve, try to locate it with a byte pattern from the
+// online config (or built-in defaults).
+// ---------------------------------------------------------------------------
+struct ApiSlot {
+    const char *name;
+    void **slot;
+};
+
+#define API_SLOT(n) { #n, reinterpret_cast<void **>(&n) }
+
+static const ApiSlot kApiSlots[] = {
+    API_SLOT(il2cpp_domain_get),
+    API_SLOT(il2cpp_domain_get_assemblies),
+    API_SLOT(il2cpp_assembly_get_image),
+    API_SLOT(il2cpp_image_get_name),
+    API_SLOT(il2cpp_image_get_class_count),
+    API_SLOT(il2cpp_image_get_class),
+    API_SLOT(il2cpp_class_get_type),
+    API_SLOT(il2cpp_class_from_type),
+    API_SLOT(il2cpp_class_get_name),
+    API_SLOT(il2cpp_class_get_namespace),
+    API_SLOT(il2cpp_class_get_flags),
+    API_SLOT(il2cpp_class_is_valuetype),
+    API_SLOT(il2cpp_class_is_enum),
+    API_SLOT(il2cpp_class_get_parent),
+    API_SLOT(il2cpp_class_get_interfaces),
+    API_SLOT(il2cpp_class_get_fields),
+    API_SLOT(il2cpp_class_get_properties),
+    API_SLOT(il2cpp_class_get_methods),
+    API_SLOT(il2cpp_class_from_name),
+    API_SLOT(il2cpp_field_get_flags),
+    API_SLOT(il2cpp_field_get_name),
+    API_SLOT(il2cpp_field_get_type),
+    API_SLOT(il2cpp_field_get_offset),
+    API_SLOT(il2cpp_field_static_get_value),
+    API_SLOT(il2cpp_property_get_get_method),
+    API_SLOT(il2cpp_property_get_set_method),
+    API_SLOT(il2cpp_property_get_name),
+    API_SLOT(il2cpp_method_get_flags),
+    API_SLOT(il2cpp_method_get_return_type),
+    API_SLOT(il2cpp_method_get_param_count),
+    API_SLOT(il2cpp_method_get_param),
+    API_SLOT(il2cpp_method_get_param_name),
+    API_SLOT(il2cpp_method_get_name),
+    API_SLOT(il2cpp_type_is_byref),
+    API_SLOT(il2cpp_is_vm_thread),
+    API_SLOT(il2cpp_thread_attach),
+    API_SLOT(il2cpp_string_new),
+};
+
+static void api_fallback_search() {
+    for (const auto &s : kApiSlots) {
+        if (*s.slot) continue;
+        std::string pat = patterns_get(s.name);
+        if (pat.empty()) continue;
+        void *addr = search_in_module("libil2cpp.so", pat);
+        if (addr) {
+            LOGI("found %s via signature @ %p", s.name, addr);
+            *s.slot = addr;
+        }
+    }
+}
+
+static uint64_t resolve_base_from_apis() {
+    for (const auto &s : kApiSlots) {
+        if (*s.slot) {
+            Dl_info dlInfo;
+            if (dladdr(*s.slot, &dlInfo)) {
+                return reinterpret_cast<uint64_t>(dlInfo.dli_fbase);
+            }
+        }
+    }
+    return 0;
+}
 
 void init_il2cpp_api(void *handle) {
 #define DO_API(r, n, p) {                      \
@@ -324,14 +404,12 @@ std::string dump_type(const Il2CppType *type) {
 
 void il2cpp_api_init(void *handle) {
     LOGI("il2cpp_handle: %p", handle);
+    patterns_init();
     init_il2cpp_api(handle);
-    if (il2cpp_domain_get_assemblies) {
-        Dl_info dlInfo;
-        if (dladdr((void *) il2cpp_domain_get_assemblies, &dlInfo)) {
-            il2cpp_base = reinterpret_cast<uint64_t>(dlInfo.dli_fbase);
-        }
-        LOGI("il2cpp_base: %" PRIx64"", il2cpp_base);
-    } else {
+    api_fallback_search();
+    il2cpp_base = resolve_base_from_apis();
+    LOGI("il2cpp_base: %" PRIx64"", il2cpp_base);
+    if (!il2cpp_base) {
         LOGE("Failed to initialize il2cpp api.");
         return;
     }
@@ -426,4 +504,9 @@ void il2cpp_dump(const char *outDir) {
     }
     outStream.close();
     LOGI("dump done!");
+
+    // Bonus: also save the decrypted libil2cpp.so and global-metadata.dat
+    // straight from memory, so they can be analysed offline with
+    // Il2CppDumper / IDA even when the on-disk copies are packed.
+    dump_lib_and_metadata(outDir);
 }
