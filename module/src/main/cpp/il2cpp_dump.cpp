@@ -4,6 +4,8 @@
 
 #include "il2cpp_dump.h"
 #include <dlfcn.h>
+#include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
@@ -11,6 +13,8 @@
 #include <vector>
 #include <sstream>
 #include <fstream>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include "xdl.h"
 #include "log.h"
@@ -26,6 +30,56 @@
 #undef DO_API
 
 static uint64_t il2cpp_base = 0;
+
+// ---------------------------------------------------------------------------
+// File-based logging (no adb needed): every step is also written to
+// <game_data_dir>/files/il2cppdumper.log so the user can check progress.
+// ---------------------------------------------------------------------------
+const char *g_log_dir = nullptr;  // set by hack.cpp before il2cpp_api_init
+static FILE *g_log = nullptr;
+
+static void logfile_open() {
+    if (!g_log_dir) return;
+    std::string dir = std::string(g_log_dir) + "/files";
+    mkdir(dir.c_str(), 0755);
+    g_log = fopen((dir + "/il2cppdumper.log").c_str(), "a");
+}
+
+static void logfile(const char *fmt, ...) {
+    if (!g_log) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(g_log, fmt, ap);
+    va_end(ap);
+    fprintf(g_log, "\n");
+    fflush(g_log);
+}
+
+// Decode the MLBB-style 16-byte trampoline to find its m_*_ptr slot:
+//     adrp x8, #page ; ldr x8, [x8, #off] ; ldr xN, [x8] ; br xN
+// The cell at (page+off) is a R_AARCH64_GLOB_DAT relocation pointing to the
+// slot variable, i.e. *cell == &m_<name>_ptr. Returns the slot address or
+// nullptr if fn is not such a trampoline.
+static void **trampoline_slot_of(void *fn) {
+    if (!fn) return nullptr;
+    uint32_t *code = (uint32_t *) fn;
+    // adrp xD, #imm
+    if ((code[0] & 0x9F000000) != 0x90000000) return nullptr;
+    // ldr xD, [xD, #imm12<<3]  (unsigned immediate, 64-bit)
+    if ((code[1] & 0xFFC00000) != 0xF9400000) return nullptr;
+    int rd = code[0] & 0x1F;
+    int rn = (code[1] >> 5) & 0x1F;
+    int rt = code[1] & 0x1F;
+    if (rd != rn || rd != rt) return nullptr;
+    int64_t immhi = (code[0] >> 5) & 0x7FFFF;
+    int64_t immlo = (code[0] >> 29) & 0x3;
+    int64_t imm = (immhi << 2) | immlo;
+    if (imm & 0x100000) imm -= 0x200000;  // sign extend 21-bit
+    uint64_t page = ((uint64_t) fn & ~0xFFFULL) + ((uint64_t) imm << 12);
+    uint64_t off = ((code[1] >> 10) & 0xFFF) << 3;
+    void **cell = (void **) (page + off);
+    return (void **) *cell;  // GLOB_DAT: cell holds the address of the slot
+}
 
 // ---------------------------------------------------------------------------
 // Signature search fallback for games that strip the exported symbols from
@@ -117,35 +171,58 @@ static uint64_t resolve_base_from_apis() {
 // real function addresses.
 // ---------------------------------------------------------------------------
 static void init_via_stub_slots(void *handle) {
+    // canary slot: try the exported OBJECT symbol first, then decode the
+    // trampoline of il2cpp_domain_get as a fallback.
     void **domain_slot = (void **) xdl_sym(handle, "m_il2cpp_domain_get_ptr", nullptr);
+    void *domain_fn = (void *) xdl_sym(handle, "il2cpp_domain_get", nullptr);
+    if (!domain_slot && domain_fn) domain_slot = trampoline_slot_of(domain_fn);
     if (!domain_slot) {
-        LOGI("no m_*_ptr slots exported (normal lib), skipping slot wait");
+        LOGI("no stub slots (normal lib), skipping slot wait");
+        logfile("[init] no stub slots (normal lib), skipping slot wait");
         return;
     }
     LOGI("stub-style lib detected, waiting for real lib registration...");
+    logfile("[init] stub-style lib detected, waiting for real lib registration...");
     const int kTimeoutSec = 120;
     int waited = 0;
     for (; waited < kTimeoutSec; ++waited) {
-        if (*domain_slot) break;
+        if (*(volatile void **) domain_slot) break;
         sleep(1);
     }
-    if (!*domain_slot) {
+    if (!*(volatile void **) domain_slot) {
         LOGE("real lib never registered within %ds", kTimeoutSec);
+        logfile("[init] ERROR: real lib never registered within %ds", kTimeoutSec);
         return;
     }
     LOGI("real lib registered after ~%ds, resolving real api addresses", waited);
+    logfile("[init] real lib registered after ~%ds", waited);
     int resolved = 0;
+    int decoded = 0;
     for (const auto &s : kApiSlots) {
+        void *real = nullptr;
         std::string slot_name = "m_";
         slot_name += s.name;
         slot_name += "_ptr";
         void **slot = (void **) xdl_sym(handle, slot_name.c_str(), nullptr);
         if (slot && *slot) {
-            *s.slot = *slot;
+            real = *slot;
+        } else {
+            void *fn = (void *) xdl_sym(handle, s.name, nullptr);
+            void **ts = trampoline_slot_of(fn);
+            if (ts && *ts) {
+                real = *ts;
+                ++decoded;
+            }
+        }
+        if (real) {
+            *s.slot = real;
             ++resolved;
         }
     }
-    LOGI("resolved %d real functions via m_*_ptr slots", resolved);
+    LOGI("resolved %d real functions via slots (%d via trampoline decode)",
+         resolved, decoded);
+    logfile("[init] resolved %d real functions via slots (%d via trampoline decode)",
+            resolved, decoded);
 }
 
 void init_il2cpp_api(void *handle) {
@@ -447,26 +524,32 @@ std::string dump_type(const Il2CppType *type) {
 
 void il2cpp_api_init(void *handle) {
     LOGI("il2cpp_handle: %p", handle);
+    logfile_open();
+    logfile("=== il2cpp_api_init handle=%p ===", handle);
     patterns_init();
     init_il2cpp_api(handle);
     init_via_stub_slots(handle);
     api_fallback_search();
     il2cpp_base = resolve_base_from_apis();
     LOGI("il2cpp_base: %" PRIx64"", il2cpp_base);
+    logfile("[init] il2cpp_base: %" PRIx64, il2cpp_base);
     if (!il2cpp_base) {
         LOGE("Failed to initialize il2cpp api.");
+        logfile("[init] ERROR: failed to initialize il2cpp api");
         return;
     }
     while (!il2cpp_is_vm_thread(nullptr)) {
         LOGI("Waiting for il2cpp_init...");
         sleep(1);
     }
+    logfile("[init] il2cpp vm thread ready");
     auto domain = il2cpp_domain_get();
     il2cpp_thread_attach(domain);
 }
 
 void il2cpp_dump(const char *outDir) {
     LOGI("dumping...");
+    logfile("[dump] dumping to %s", outDir);
     size_t size;
     auto domain = il2cpp_domain_get();
     auto assemblies = il2cpp_domain_get_assemblies(domain, &size);
@@ -548,6 +631,7 @@ void il2cpp_dump(const char *outDir) {
     }
     outStream.close();
     LOGI("dump done!");
+    logfile("[dump] dump.cs written (%zu types)", outPuts.size());
 
     // Bonus: also save the decrypted libil2cpp.so and global-metadata.dat
     // straight from memory, so they can be analysed offline with

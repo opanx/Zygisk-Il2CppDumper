@@ -5,6 +5,8 @@
 #include "hack.h"
 #include "il2cpp_dump.h"
 #include "log.h"
+
+extern const char *g_log_dir;
 #include "xdl.h"
 #include <cstring>
 #include <cstdio>
@@ -63,6 +65,7 @@ void hack_start(const char *game_data_dir) {
         }
     }
     if (handle) {
+        g_log_dir = game_data_dir;
         il2cpp_api_init(handle);
         il2cpp_dump(game_data_dir);
     } else {
